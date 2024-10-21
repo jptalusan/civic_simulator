@@ -1,0 +1,17 @@
+line-length = 119
+indent-width = 4
+exclude = ["*.ipynb"]
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["F405", "F403", "F841", "E722"]
+fixable = ["ALL"]
+unfixable = []
+
+
+[format]
+# Like Black, use double quotes for strings.
+quote-style = "double"
+
+# Like Black, indent with spaces, rather than tabs.
+indent-style = "space"
