@@ -1,2 +1,12 @@
 pytest==8.3.2
 geopandas==0.14.4
+spdlog==2.0.6
+numpy==1.26.4
+matplotlib==3.9.2
+networkx==3.3
+osmnx==1.9.4
+python-dotenv==1.0.1
+pydeck==0.9.1
+scikit-learn==1.5.2
+gtfs_functions==2.5
+h3==3.7.7

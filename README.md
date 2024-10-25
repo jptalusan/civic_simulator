@@ -25,3 +25,5 @@
 * BOC.geojson
     * This was manually generated for now.
     * I will add it to the data folder.
+* County codes:
+    * [TN](https://www2.census.gov/geo/docs/reference/codes2020/cou/st47_tn_cou2020.txt)

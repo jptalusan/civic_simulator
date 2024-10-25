@@ -1,28 +1,36 @@
 import requests
 import pandas as pd
 
-def get_census_data(api_key, api_url, table_name, state_fips, county_fips, block_groups, county_only):
+def get_census_data(api_key, api_url, table_name, state_fips, county_fips, block_groups, level="block"):
     # print(block_groups)
     url = api_url
 
-    if county_only:
+    if level == "county":
         params = {
             "get": f"NAME,group({table_name})",
             "for": f"county:{county_fips}",
             "in": f"state:{state_fips}",
             "key": api_key,
         }
-    else:
+    elif level == "block":
         params = {
             "get": f"NAME,group({table_name})",
             "for": f"block group:{block_groups}",
             "in": f"state:{state_fips} county:{county_fips}",
             "key": api_key,
         }
-    # print(url)
-    # print(params)
+    elif level == "tract":
+        params = {
+            "get": f"NAME,group({table_name})",
+            "for": f"tract:{block_groups}",
+            "in": f"state:{state_fips} county:{county_fips}",
+            "key": api_key,
+        }
+
+    print(url)
+    print(params)
     response = requests.get(url, params=params)
-    # print(response.url)
+    print(response.url)
 
     if response.status_code == 200:
         data = response.json()
