@@ -10,3 +10,4 @@ pydeck==0.9.1
 scikit-learn==1.5.2
 gtfs_functions==2.5
 h3==3.7.7
+dateparser==1.2.0
