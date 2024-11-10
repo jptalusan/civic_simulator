@@ -1,5 +1,6 @@
 # This is for running offline solvers in parallel.
 # TODO: Change all 2024-10-01 references to the config file params.current_date
+from keplergl import KeplerGl
 import multiprocessing as mp
 import pandas as pd
 import geopandas as gpd
@@ -21,8 +22,9 @@ import argparse
 import rapidroutesim.fixedline_simulator.constants as constants
 from rapidroutesim.fixedline_simulator.event import Event
 from rapidroutesim.fixedline_simulator.vehicle import ExpressBus
+from rapidroutesim.fixedline_simulator.utils import generate_metrics_for_on_demand, get_linestring_duration_distance_for_OD_pair_dict, get_stops_df
 import logging
-
+from gtfs_functions import Feed
 
 # Create a logger
 logger = logging.getLogger(__name__)
@@ -59,19 +61,6 @@ def read_json_edit_key(fp, key, val):
         json.dump(data, f, indent=4)
     return True
 
-def get_linestring_duration_distance_for_OD_pair_dict(source, target):
-    source_pt = {"lat": source['lat'], "lon": source['lon']}
-    target_pt = {"lat": target['lat'], "lon": target['lon']}
-    url = f"http://localhost:8080/route/v1/driving/{source_pt['lon']},{source_pt['lat']};{target_pt['lon']},{target_pt['lat']}?geometries=geojson&overview=full&steps=true"    
-    res = requests.post(url)
-    r = res.json()
-    coordinates = r['routes'][0]['geometry']['coordinates']
-    line = LineString(coordinates)
-    duration = r['routes'][0]['duration']
-    distance = r['routes'][0]['distance']
-    
-    return line, duration, distance
-
 def read_results_csv(root_dir, filename):
     all_data = []
     for root, dirs, files in os.walk(root_dir):
@@ -80,9 +69,11 @@ def read_results_csv(root_dir, filename):
             df = pd.read_csv(file_path, index_col=0)
 
             if filename == 'results.csv':
-                df['COUNTYFP'].bfill(inplace=True)
-                df['COUNTYFP'].ffill(inplace=True)
+                df['COUNTYFP'] = df['COUNTYFP'].bfill()
+                df['COUNTYFP'] = df['COUNTYFP'].ffill()
             all_data.append(df)
+    all_data = pd.concat(all_data)
+    return all_data
 
 def create_vehicles_list(count, capacity, out_dir):
     data = {}
@@ -151,7 +142,7 @@ def convert_BOC_requests_to_payload(requests_df):
 def generate_results(manifest, county_requests, COUNTY="CHESTER", config={}):
     EXPERIMENT_NAME = config["params"]["output_name"]
 
-    BASE_DATA = f"data/BOC/{COUNTY}"
+    BASE_DATA = f"data/{EXPERIMENT_NAME}/{COUNTY}"
     OUTPUT_DIR = f"output/{EXPERIMENT_NAME}/{COUNTY}"
     Path(f"{OUTPUT_DIR}").mkdir(parents=True, exist_ok=True)
 
@@ -231,7 +222,8 @@ def generate_results(manifest, county_requests, COUNTY="CHESTER", config={}):
 
 
 def solve_requests(COUNTY="CHESTER", county_requests=None, config={}):
-    BASE_DATA = f"data/BOC/{COUNTY}"
+    EXPERIMENT_NAME = config["params"]["output_name"]
+    BASE_DATA = f"data/{EXPERIMENT_NAME}/{COUNTY}"
     queue = EventQueue(f"{BASE_DATA}/events/")
     logistics = Logistics(f"{BASE_DATA}/logistics/")
     router = Router(f"{BASE_DATA}/logistics/solver_sample.json")
@@ -259,12 +251,16 @@ def solve_requests(COUNTY="CHESTER", county_requests=None, config={}):
         employee_arrivals = convert_on_demand_results_to_transit_arrivals(config, COUNTY.upper())
         fixed_line_result = run_fixed_line_simulator(employee_arrivals, config, COUNTY.upper())
 
-    merged_results = compute_final_metrics(config=config, county=COUNTY, 
+    fixed_line_metrics, on_demand_metrics, per_user_metrics = compute_final_metrics(config=config, county=COUNTY, 
+                                           county_requests=county_requests,
                                            on_demand_result=on_demand_result,
                                            fixed_line_result=fixed_line_result)
-    return merged_results
+    return fixed_line_metrics, on_demand_metrics, per_user_metrics
 
 def get_requests_per_county(countyname, county):
+    '''
+    requests should have COUNTYFP, shift, transit_taker, in_city, h_lat, h_lon, w_lat, w_lon
+    '''
     named_stops = config["named_stops"]
     counties = config["counties"]
     on_demand_depot_to_boc = config["on_demand_depot_to_boc"]
@@ -288,10 +284,6 @@ def get_requests_per_county(countyname, county):
     if ONLY_TRANSIT_TAKERS:
         county_requests = county_requests[(county_requests["transit_taker"])]
 
-#         # count = int(len(county_requests.index) * TRANSIT_TAKER_PERCENTAGE)
-#         # county_requests = county_requests.sample(count, replace=False, random_state=SEED)
-#         # print("Input", count, county_requests.user_id.tolist()[0:5])
-
     if USE_CITY_BUSES_TO_TRANSIT_HUB:
         county_requests = county_requests[~county_requests['in_city']]
 
@@ -309,6 +301,8 @@ def get_requests_per_county(countyname, county):
     return county_requests
 
 def setup_input_jsons(config):
+    EXPERIMENT_NAME = config["params"]["output_name"]
+
     _add = ''
     MEMPHIS_CLUSTERED = config["params"]["memphis_clustered"]
     OUTPUT_NAME = config["params"]["output_name"]
@@ -322,10 +316,10 @@ def setup_input_jsons(config):
     
     on_demand_start_time = config["schedules"]["on_demand_start_time"]
     on_demand_end_time = config["schedules"]["on_demand_end_time"]
-    print(on_demand_start_time)
+    logger.info(f"Start of on-demand service: {on_demand_start_time}")
 
     WORK_DIR = "/Users/jose/Developer/git/RapidRouteSim"
-    DATA_DIR = f"{WORK_DIR}/data/BOC"
+    DATA_DIR = f"{WORK_DIR}/data/{EXPERIMENT_NAME}"
     BASE_EVENTS = f"{WORK_DIR}/data/events/"
     BASE_LOGISTICS = f"{WORK_DIR}/data/logistics/"
 
@@ -374,10 +368,12 @@ def setup_input_jsons(config):
     return county_requests_dict
 
 def run_fixed_line_simulator(employee_arrivals=None, config={}, county="CHESTER"):
+    EXPERIMENT_NAME = config["params"]["output_name"]
+
     logger.info(f"Starting fixed line simulations for {county.title()}")
 
     travel_time_distance_matrix_file = config["params"]["travel_time_distance_matrix_file"]
-    tt_d_matrix = gpd.read_file(f"./data/{travel_time_distance_matrix_file}.geojson")
+    tt_d_matrix = gpd.read_file(f"./data/{EXPERIMENT_NAME}/{travel_time_distance_matrix_file}")
     county_stops = tt_d_matrix[tt_d_matrix['county'] == county.upper()]
 
     buses, events = recreate_fixed_line_bus_events(config, county)
@@ -388,6 +384,8 @@ def run_fixed_line_simulator(employee_arrivals=None, config={}, county="CHESTER"
     end_time_str = config["schedules"]["fixed_line_end_time"]
     end_time_dt = dateparser.parse(f"{config_date_str} {end_time_str}")
     
+    start_of_day_dt = start_time_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
     logger.info(f"Start and end times:{start_time_dt} and {end_time_dt}")
 
     people_at_destination = 0
@@ -401,6 +399,8 @@ def run_fixed_line_simulator(employee_arrivals=None, config={}, county="CHESTER"
     logger.debug(f"End time: {end_time_dt + dt.timedelta(hours=1)}")
 
     current_time_dt = start_time_dt
+
+    fixed_line_results = []
     while (len(events) > 0) & (current_time_dt < (end_time_dt + dt.timedelta(hours=1))):
         new_events = []
         event = events.pop(0)
@@ -408,9 +408,12 @@ def run_fixed_line_simulator(employee_arrivals=None, config={}, county="CHESTER"
 
         current_time_dt = event.time
         tempdf = employee_arrivals.loc[employee_arrivals['adjusted_scheduled_time_dt'] <= current_time_dt]
+        
         people_currently_at_stop = 0
+        people_id_currently_at_stop = []
         if not tempdf.empty:
             people_currently_at_stop = tempdf['count'].sum() - total_people_picked
+            people_id_currently_at_stop = tempdf['list'].explode().tolist()[total_people_picked:]
 
         event_info = event.type_specific_information
         current_stop = event_info['current_stop']
@@ -431,6 +434,7 @@ def run_fixed_line_simulator(employee_arrivals=None, config={}, county="CHESTER"
                 picked_up = min(free_seats, people_currently_at_stop)
                 bus.load += picked_up
                 total_people_picked += picked_up
+                bus.current_passenger_ids = people_id_currently_at_stop
 
             travel_time_to_next_stop = county_stops.iloc[current_stop]['duration_s']
             distance_to_next_stop = county_stops.iloc[current_stop]['distance_m']
@@ -440,22 +444,37 @@ def run_fixed_line_simulator(employee_arrivals=None, config={}, county="CHESTER"
                         type_specific_information={"bus_id":bus_id, "current_stop": current_stop + 1})
             new_events.append(new_event)
 
+            # Results
+            res = {"bus_id": bus_id, "current_stop": stop_name, "next_stop": next_stop, "action": "pickup",
+                   "ons": picked_up, "offs":0, "current_time": (current_time_dt - start_of_day_dt).total_seconds(),
+                   "served_user_ids": bus.current_passenger_ids}
+            fixed_line_results.append(res)
+
             if "boc_conex" not in stop_name:
                 logger.debug(f"bus: {bus_id}, pick {picked_up} people @ {current_time_dt} on {stop_name}")
                 # print(f"remaining: {people_at_stop}")
 
         elif event_type == constants.EVENT_DROPOFF:
             stop_name = county_stops.iloc[current_stop]['source']
+            next_stop = county_stops.iloc[current_stop]['target']
             
             new_event = Event(event_type=constants.EVENT_PICKUP, time=current_time_dt, 
                         type_specific_information={"bus_id":bus_id, "current_stop": current_stop})
             new_events.append(new_event)
-            if 'boc_conex' == stop_name:
-                logger.debug(f"bus: {bus_id}, drop {bus.load} people @ {current_time_dt} on {stop_name}")
+            # if 'boc_conex' == stop_name:
+            logger.debug(f"bus: {bus_id}, drop {bus.load} people @ {current_time_dt} on {stop_name}")
+            dropped_off = bus.load
+            passenger_ids = bus.current_passenger_ids
+            bus.load = 0
+            bus.current_passenger_ids = []
+            people_at_destination += dropped_off
+            total_people_served += dropped_off
 
-                people_at_destination += bus.load
-                total_people_served += bus.load
-                bus.load = 0
+            res = {"bus_id": bus_id, "current_stop": stop_name, "next_stop": next_stop, "action": "dropoff",
+                   "ons": 0, "offs":dropped_off, "current_time": (current_time_dt - start_of_day_dt).total_seconds(),
+                   "served_user_ids": passenger_ids}
+            
+            fixed_line_results.append(res)
 
         for ne in new_events:
             events.append(ne)
@@ -466,6 +485,8 @@ def run_fixed_line_simulator(employee_arrivals=None, config={}, county="CHESTER"
     served_users_in_county = tdf['list'].explode().tolist()[:total_people_served]
     logger.debug(f"Served {len(served_users_in_county)}. {served_users_in_county}")
 
+    fixed_line_results = pd.DataFrame(fixed_line_results)
+
     result = {
         "countyname": county.upper(),
         "served": total_people_served,
@@ -473,56 +494,361 @@ def run_fixed_line_simulator(employee_arrivals=None, config={}, county="CHESTER"
         "served_ids": served_users_in_county,
         "pct_served": total_people_served / total_passengers_from_county * 100
     }
-              
-    return result
+
+    return fixed_line_results
 
 def get_datetime(current_date_dt, x):
     return current_date_dt + dt.timedelta(seconds=x)
 
 def main(config, county_requests):
-
-    # Define the arguments for the function
-    # counties = ["SHELBY0", "SHELBY1"]
-    
-    # counties = list(config["counties"].keys())
-    counties = ["CHESTER"]
+    '''
+    Runs multiple counties in parallel then returns aggregate datasets.
+    Returns (counties, fixed_line_results, on_demand_results, per_user_results)
+    '''
+    counties = list(config["counties"].keys())
+    # counties = ["CHESTER"]
+    if "SHELBY" in counties:
+        counties.remove("SHELBY")
     print(f"Starting offline solver for: {counties}")
 
     args = []
     for county in counties:
-        args.append((county, county_requests[county], config))
+        if len(county_requests[county].index) > 0:
+            logger.debug(f"Total requests for {county} is {len(county_requests[county].index)}")
+            args.append((county, county_requests[county], config))
 
     # # Create a pool of worker processes
     with mp.Pool() as pool:
         # Apply the function to the arguments in parallel
         simulation_results = pool.starmap(solve_requests, args)
 
-    results = []
+    fixed_line_results = []
+    on_demand_results = []
+    per_user_results = []
     # Save the results separately per process
-    for i, result in enumerate(simulation_results):
-        results.append(result)
+    for i, (f, o, u) in enumerate(simulation_results):
+        fixed_line_results.append(f)
+        on_demand_results.append(o)
+        per_user_results.append(u)
     
-    results_df = pd.DataFrame(results)
-    print(results_df)
+    fixed_line_results = pd.concat(fixed_line_results)
+    on_demand_results = pd.concat(on_demand_results)
+    per_user_results = pd.concat(per_user_results)
 
-def compute_final_metrics(config, county, on_demand_result, fixed_line_result):
-    result = {"county": county,
-              "fixed_line_requests": 0,
-              "fixed_line_served": 0,
-              "on_demand_requests": 0,
-              "on_demand_served": 0,
-              "on_demand_VMT": 0,
-              "on_demand_PMT": 0,
-              "fixed_line_VMT": 0,
-              "fixed_line_PMT": 0
-    }
-    return result
+    return counties, fixed_line_results, on_demand_results, per_user_results
+
+def compute_final_metrics(config, county, county_requests, on_demand_result, fixed_line_result):
+    '''
+    Returns (fixed_line_metrics, on_demand_metrics, per_user_metrics)
+    '''
+    EXPERIMENT_NAME = config["params"]["output_name"]
+
+    travel_time_distance_matrix_file = config["params"]["travel_time_distance_matrix_file"]
+    tt_d_df = gpd.read_file(f"./data/{EXPERIMENT_NAME}/{travel_time_distance_matrix_file}")
+
+    def get_travel_time_distance_for_fixed_line(row):
+        data = tt_d_df[(tt_d_df['source'] == row['current_stop']) & \
+                       (tt_d_df['target'] == row['next_stop'])]
+        if data.empty:
+            raise f"County: {county}: Source and target: {row['current_stop']}, {row['next_stop']} not found."
+        data = data.iloc[0]
+        return data['duration_s'], data['distance_m']
+    
+    # per fixed line bus metrics
+    fixed_line_metrics = []
+
+    if not fixed_line_result.empty:
+        # Adding distance and travel times?
+        fixed_line_result[["duration_s", "distance_m"]] = fixed_line_result.apply(get_travel_time_distance_for_fixed_line, axis=1, result_type="expand")
+        fixed_line_result["type"] = constants.EXPRESS_BUS
+
+        for bus_id, df in fixed_line_result.groupby("bus_id"):
+            fixed_line_served = df["offs"].sum()
+            fixed_line_duration = df['duration_s'].sum()
+            tdf = df.drop_duplicates(subset=["current_time"])
+            fixed_line_VMT = tdf['distance_m'].sum() / constants.METER_IN_MILES
+            fixed_line_PMT = fixed_line_served * tdf['distance_m'].iloc[0] / constants.METER_IN_MILES
+            fixed_line_metric= {"county": county, 
+                                 "run_id": bus_id, 
+                                 "served": fixed_line_served,
+                                 "requests": -1,
+                                 "vmt": fixed_line_VMT, 
+                                 "pmt": fixed_line_PMT
+                                 }
+            fixed_line_metrics.append(fixed_line_metric)
+
+    fixed_line_metrics = pd.DataFrame(fixed_line_metrics)
+
+    # TODO: Remove when done debugging
+    on_demand_result = pd.read_csv(f"./output/TEST/{county}/results.csv")
+
+    if (on_demand_result is not None):
+        if (not on_demand_result.empty):
+            on_demand_metrics = []
+            per_user_on_demand_metrics = []
+            for (countyfp, run_id), v in on_demand_result.groupby(["COUNTYFP", "run_id"]):
+                v = v.reset_index(drop=True).sort_values(by="scheduled_time")
+
+                # Served count
+                served_count = v.query("action == 'dropoff'").shape[0]
+
+                v.loc[0, "lat"] = v.iloc[0].h_lat
+                v.loc[0, "lon"] = v.iloc[0].h_lon
+
+                v.loc[v.shape[0]-1, "lat"] = v.iloc[0].h_lat
+                v.loc[v.shape[0]-1, "lon"] = v.iloc[0].h_lon
+
+                v['next_lat'] = v['lat'].shift(-1)
+                v['next_lon'] = v['lon'].shift(-1)
+                # drop the last row since it is redundant.
+                v = v[:-1]
+                # For vehicle miles traveled.
+                v[['_', 'duration', 'distance']] = v.apply(generate_metrics_for_on_demand, axis=1, result_type="expand")
+                
+                # For passenger miles traveled
+                user_df = v.query("action == 'pickup'").copy()
+                user_df = user_df.drop(columns=["lat", "lon", "next_lat", "next_lon"])
+                user_df = user_df.rename(columns={"h_lat": "lat", "h_lon": "lon", "w_lat": "next_lat", "w_lon": "next_lon"})
+                user_df[['_', 'duration', 'distance']] = user_df.apply(generate_metrics_for_on_demand, axis=1, result_type="expand")
+
+                # For gathering per user metrics
+                tempdf = on_demand_result[on_demand_result['action'].isin(["pickup", "dropoff"])][['user_id', 'scheduled_time']]
+                tempdf = tempdf.merge(user_df, on=["user_id", "scheduled_time"], suffixes=["_x", "_user"], how="outer")
+                for user_id, df in tempdf.groupby("user_id"):
+                    arrival_time = df.iloc[-1]['scheduled_time']
+                    departure_time = df.iloc[0]['scheduled_time']
+                    travel_duration_s = arrival_time - departure_time
+                    travel_distance_m = df.iloc[0]['distance']
+                    res = {
+                            "county": county,
+                            "bus_id": run_id,
+                            "user_id": user_id, 
+                            "departure_time": departure_time,
+                            "arrival_time": arrival_time,
+                            "travel_duration_s":travel_duration_s, 
+                            "distance_m":travel_distance_m,
+                            "type": constants.ON_DEMAND
+                            }
+                    per_user_on_demand_metrics.append(res)
+
+                county_run_metric = {
+                                    "county": county,
+                                    "run_id": run_id, 
+                                    "served": served_count,
+                                    "requests": -1,
+                                    "vmt": v['distance'].sum() / constants.METER_IN_MILES, 
+                                    "pmt": user_df['distance'].sum() / constants.METER_IN_MILES,
+                                    "countyfp": countyfp, 
+                                    }
+                on_demand_metrics.append(county_run_metric)
+            on_demand_metrics = pd.DataFrame(on_demand_metrics)
+    else:
+        logger.error("No on demand result provided.")
+
+    # per user metrics
+    per_user_metrics = []
+
+    # Fixed line user metrics: Only if fixed_line was used
+    tdf = fixed_line_result.copy()
+    tdf = tdf.explode('served_user_ids')
+    tdf = tdf.reset_index(drop=True)
+    tdf = tdf.dropna(subset=["served_user_ids"])
+    for user_id, user_df in tdf.groupby("served_user_ids"):
+        arrival_time = user_df.iloc[-1]['current_time']
+        departure_time = user_df.iloc[0]['current_time']
+        travel_duration_s = arrival_time - departure_time
+        travel_distance_m = user_df.iloc[0]['distance_m']
+        fixed_line_user = {"county": county,
+                           "bus_id": user_df.iloc[0].bus_id,
+                           "user_id": user_id, 
+                           "departure_time": departure_time,
+                           "arrival_time": arrival_time,
+                           "travel_duration_s":travel_duration_s, 
+                           "distance_m":travel_distance_m,
+                           "type": constants.EXPRESS_BUS}
+
+        per_user_metrics.append(fixed_line_user)
+    
+    per_user_metrics.extend(per_user_on_demand_metrics)
+    per_user_metrics = pd.DataFrame(per_user_metrics)
+
+    return fixed_line_metrics, on_demand_metrics, per_user_metrics
+
+# TODO: Parameterize the times for GTFS etc...
+# TODO: DST is messing up my time zones (kepler is not helping)
+def generate_kepler_geojson(config, counties=["CHESTER"], per_user_metrics=None, county_requests=None, all_results=None):
+    '''
+    returns (mata_geo_json, on_demand_geo_json, express_geo_json, requests_with_isServed_bool)
+
+    '''
+    USE_CITY_BUSES_TO_TRANSIT_HUB = config["params"]["use_city_buses"]
+    ON_DEMAND_TO_TRANSIT_HUB = config["params"]["to_transit_hub"]
+
+    EXPERIMENT_NAME = config["params"]["output_name"]
+    SCENARIO_OUTPUT = f"./output/{EXPERIMENT_NAME}"
+
+    TRAVEL_TIME_DISTANCE_MATRIX_FILE = config["params"]["travel_time_distance_matrix_file"]
+    TRAVEL_TIME_DISTANCE_MATRIX_FILE = f"./data/{EXPERIMENT_NAME}/{TRAVEL_TIME_DISTANCE_MATRIX_FILE}"
+    FIXED_LINE_FREQUENCY_MIN = int(config["schedules"]["fixed_line_frequency_min"])
+    window_list = ['0:00-6:00', '6:00-9:00']
+    earliest_run = 18000 # 5 am
+    date_str = config["params"]["current_date"]
+    date = dateparser.parse(date_str)
+    date = date.replace(hour=1, minute=0)
+
+    # Fixed line
+    fixed_line_start_time = config["schedules"]["fixed_line_start_time"]
+    fixed_line_start_time = dateparser.parse(f"{date_str} {fixed_line_start_time}") - dt.timedelta(hours=4)
+
+    ######## MATA GEOJSON ########
+    mata_geo_json = {}
+    if USE_CITY_BUSES_TO_TRANSIT_HUB:
+        # It also works with URL's
+        gtfs_path = './data/GTFS_MATA.zip'
+
+        feed = Feed(gtfs_path, busiest_date=False,)
+        lines_freq = feed.lines_freq
+        stop_freq = feed.stops_freq
+
+        condition_window = lines_freq.window.isin(window_list)
+        gdf = lines_freq.loc[(condition_window),:].reset_index()
+        segments_gdf = feed.segments
+
+        route_ids = gdf.route_id.unique().tolist()
+
+        all_routes_and_trips = []
+        for route_id in route_ids:
+        # go through each trip_id group and create their segment geojson
+            sdf = get_stops_df(feed=feed, route_id=route_id, window_list=window_list, earliest_time=earliest_run)
+            route_segments_df = segments_gdf[segments_gdf['route_id'] == route_id]
+            for k, v in sdf.groupby("trip_id"):
+                v['start_stop_id'] = v['stop_id']
+                v['end_stop_id'] = v['stop_id'].shift(-1)
+                v['travel_time'] = v['arrival_time'].shift(-1) - v['arrival_time']
+                v['travel_time'] = v['travel_time'].fillna(0.0)
+                v = v.merge(route_segments_df[['shape_id', 'stop_sequence', 'start_stop_id', 'distance_m', 'geometry']], on=['shape_id', 'stop_sequence', 'start_stop_id'])
+                all_routes_and_trips.append(v)
+                
+        all_routes_and_trips_df = pd.concat(all_routes_and_trips)
+        all_routes_and_trips_df = gpd.GeoDataFrame(all_routes_and_trips_df, geometry='geometry')
+        all_routes_and_trips_df.plot(figsize=(2, 2))
+
+        mata_geo_json = dict(type="FeatureCollection", features=[])
+
+        for (route_id, trip_id), v in all_routes_and_trips_df.groupby(["route_id", "trip_id"]):
+            v = v.sort_values(by="arrival_time", ascending=True)
+            feature = dict(type="Feature", geometry=None, properties=dict(route_id=str(route_id), trip_id=str(trip_id)))
+            
+            data = []
+            for j, w in v.iterrows():
+                geom = w['geometry']
+                duration = w['travel_time']
+                time_per_seg = duration/len(geom.coords)
+                timestamp = (date + dt.timedelta(seconds=w['arrival_time']) - dt.timedelta(hours=5)).timestamp()
+                if timestamp > fixed_line_start_time.timestamp():
+                    continue
+                for coord in geom.coords:
+                    timestamp += time_per_seg
+                    data.append([coord[0], coord[1], 0, int(timestamp)])
+                feature["geometry"] = dict(type="LineString", coordinates=data)
+            mata_geo_json["features"].append(feature)
+    
+    ######## ON DEMAND GEOJSON ########
+    combined_result = read_results_csv(SCENARIO_OUTPUT, filename='results.csv')
+    combined_result['scheduled_time_dt'] = combined_result['scheduled_time'].apply(lambda x: get_datetime(date, x))
+
+    on_demand_routes_df = []
+    on_demand_geo_json = {}
+    for (county, run_id), v in combined_result.groupby(["COUNTYFP", "run_id"]):
+        v = v.reset_index(drop=True).sort_values(by="scheduled_time")
+        v.loc[0, "lat"] = v.iloc[0].h_lat
+        v.loc[0, "lon"] = v.iloc[0].h_lon
+
+        v.loc[v.shape[0]-1, "lat"] = v.iloc[0].h_lat
+        v.loc[v.shape[0]-1, "lon"] = v.iloc[0].h_lon
+
+        v['next_lat'] = v['lat'].shift(-1)
+        v['next_lon'] = v['lon'].shift(-1)
+        v = v[:-1]
+
+        v[['geometry', 'duration', 'distance']] = v.apply(generate_metrics_for_on_demand, axis=1, result_type="expand")
+        v.loc[v.index[-1], 'action'] = "depot_end"
+        on_demand_routes_df.append(v[['COUNTYFP', 'run_id', 'lat', 'lon', 'next_lat', 'next_lon', 'geometry', 'duration', 'distance', 'action', "scheduled_time"]])
+    on_demand_routes_df = pd.concat(on_demand_routes_df)
+    on_demand_routes_df["run_id"] = on_demand_routes_df["run_id"].astype('str')
+    on_demand_geo_json = dict(type="FeatureCollection", features=[])
+
+    for (county, run_id), v in on_demand_routes_df.groupby(["COUNTYFP", "run_id"]):
+        v = v.sort_values(by="scheduled_time", ascending=True)
+        feature = dict(type="Feature", geometry=None, properties=dict(run_id=run_id, county=county))
+        
+        data = []
+        timestamp = date.timestamp()
+        for j, w in v.iterrows():
+            geom = w['geometry']
+            duration = w['duration']
+            time_per_seg = duration/len(geom.coords)
+            for coord in geom.coords:
+                timestamp += time_per_seg
+                data.append([coord[0], coord[1], 0, int(timestamp)])
+            feature["geometry"] = dict(type="LineString", coordinates=data)
+        on_demand_geo_json["features"].append(feature)
+
+    ######## FIXED LINE GEOJSON ########
+    express_geo_json = {}
+    if ON_DEMAND_TO_TRANSIT_HUB:
+        df = gpd.read_file(TRAVEL_TIME_DISTANCE_MATRIX_FILE)
+
+        all_county_buses_schedule_df = []
+        for county, v in df.groupby("county"):
+            bus_count = config["fixed_line_assets"][county.upper()]["count"]
+            for bus_id in range(bus_count):
+                v['run_id'] = bus_id
+                all_county_buses_schedule_df.append(v.copy())
+        all_county_buses_schedule_df = pd.concat(all_county_buses_schedule_df)
+        
+        express_geo_json = dict(type="FeatureCollection", features=[])
+
+        for (county, run_id), v in all_county_buses_schedule_df.groupby(["county", "run_id"]):
+            for bus_id in range(bus_count):
+                feature = dict(type="Feature", geometry=None, properties=dict(run_id=str(run_id), county=str(county)))
+                
+                data = []
+                timestamp = fixed_line_start_time + dt.timedelta(minutes=(FIXED_LINE_FREQUENCY_MIN * bus_id))
+                timestamp = timestamp.timestamp()
+                for j, w in v.iterrows():
+                    geom = w['geometry']
+                    duration = w['duration_s']
+                    time_per_seg = duration/len(geom.coords)
+                    for coord in geom.coords:
+                        timestamp += time_per_seg
+                        data.append([coord[0], coord[1], 0, int(timestamp)])
+                    feature["geometry"] = dict(type="LineString", coordinates=data)
+                express_geo_json["features"].append(feature)
+
+    ######## HUBS and PICKUP POINTS ########
+    named_stops = pd.DataFrame(config["named_stops"])
+    named_stops = named_stops.T.reset_index()
+    named_stops = named_stops.rename(columns={"index":"county"})
+    named_stops['icon'] = "place"
+    ######## USER REQUESTS DF ########
+    served_users = per_user_metrics
+    served_users['user_id'] = served_users['user_id'].astype('int')
+    
+    displayed_requests = []
+    for county in counties:
+        displayed_requests.append(county_requests[county])
+    displayed_requests = pd.concat(displayed_requests)
+    displayed_requests["is_served"] = False
+    displayed_requests.loc[displayed_requests['user_id'].isin(served_users['user_id'].unique().tolist()), "is_served"] = True
+
+    return mata_geo_json, on_demand_geo_json, express_geo_json, named_stops, displayed_requests
 
 # TODO: If to_transit_hub == False, skip this, but compute the metrics
 def convert_on_demand_results_to_transit_arrivals(config, county):
     EXPERIMENT_NAME = config["params"]["output_name"]
 
-    BASE_DATA = f"data/BOC/{county}"
+    BASE_DATA = f"data/{EXPERIMENT_NAME}/{county}"
     OUTPUT_DIR = f"output/{EXPERIMENT_NAME}/{county}"
 
     CURRENT_DATE_STR = config["params"]["current_date"]
@@ -593,6 +919,7 @@ def generate_traveltime_and_distance_matrices_for_fixed_line(config):
     Loop until the end of the travel times.??
     linestring, duration, distance = get_linestring_duration_distance_for_OD_pair_dict(source, target)
     '''
+    EXPERIMENT_NAME = config["params"]["output_name"]
     counties = config['counties']
     named_stops = config["named_stops"]
     travel_time_distance_matrix_file = config["params"]["travel_time_distance_matrix_file"]
@@ -626,7 +953,7 @@ def generate_traveltime_and_distance_matrices_for_fixed_line(config):
         fixed_stops_travel_distance_matrix = pd.DataFrame(fixed_stops_travel_distance_matrix)
         fixed_stops_travel_distance_matrix = gpd.GeoDataFrame(fixed_stops_travel_distance_matrix,
                                                               geometry="geometry")
-        fixed_stops_travel_distance_matrix.to_file(f"./data/{travel_time_distance_matrix_file}.geojson")
+        fixed_stops_travel_distance_matrix.to_file(f"./data/{EXPERIMENT_NAME}/{travel_time_distance_matrix_file}")
     
     pair_and_cycle_stops()
     logger.info("Finished generating matrices.")
@@ -640,6 +967,9 @@ if __name__ == "__main__":
     with open(args.config, 'r') as f:
         config = json.load(f)
 
+    EXPERIMENT_NAME = config["params"]["output_name"]
+    Path(f"./data/{EXPERIMENT_NAME}").mkdir(parents=True, exist_ok=True)
+
     # Use config dictionary here
 
     if config["params"]["regenerate_matrix"]:
@@ -652,11 +982,40 @@ if __name__ == "__main__":
     county_requests = setup_input_jsons(config)
 
     logger.info(f"Solving on-demand requests offline: {config['counties'].keys()}.")
-    main(config, county_requests)
-    
+    counties, fixed_line_results, on_demand_results, per_user_results = main(config, county_requests)
     
     # ON_DEMAND_TO_TRANSIT_HUB = config["params"]["to_transit_hub"]
     # if ON_DEMAND_TO_TRANSIT_HUB:
-    #     employee_arrivals = convert_on_demand_results_to_transit_arrivals(config, "GIBSON")
+    #     employee_arrivals = convert_on_demand_results_to_transit_arrivals(config, "CHESTER")
     # employee_arrivals.to_csv("checkthis.csv")
-    # run_fixed_line_simulator(employee_arrivals, config, "GIBSON")
+    # fixed_line_result = run_fixed_line_simulator(employee_arrivals, config, "CHESTER")
+    # fixed_line_metrics, on_demand_metrics, per_user_metrics = compute_final_metrics(config=config, county="CHESTER", 
+    #                       county_requests=None,
+    #                       on_demand_result=None, fixed_line_result=fixed_line_result)
+
+    mata, on_demand, fixed_line, named_stops, displayed_requests = generate_kepler_geojson(config, counties=counties, 
+                                                                                           county_requests=county_requests, 
+                                                                                           per_user_metrics=per_user_results)
+    
+    logger.info(f"Saving results to: output/{EXPERIMENT_NAME}")
+    fixed_line_results.to_csv(f"./output/{EXPERIMENT_NAME}/fixed_line_results.csv")
+    on_demand_results.to_csv(f"./output/{EXPERIMENT_NAME}/on_demand_results.csv")
+    per_user_results.to_csv(f"./output/{EXPERIMENT_NAME}/per_user_results.csv")
+
+    # print(mata)
+    kepler_json_file = config["visualization"]["kepler_config"]
+
+    with open(f"./data/{kepler_json_file}") as f:
+        kepler_config = json.load(f)
+
+    my_map = KeplerGl(data={
+                            "on-demand":on_demand, 
+                            "fixed-line":fixed_line,
+                            "mata": mata, 
+                            "requests":displayed_requests, 
+                            "hubs": named_stops
+                            }, 
+                            config=kepler_config,
+                            height=800, width=300)
+
+    my_map.save_to_html(file_name=f'./output/{EXPERIMENT_NAME}/kepler_{EXPERIMENT_NAME.split("/")[-1]}.html')
